@@ -1,6 +1,6 @@
-# graph —— 在自己程序里用上 CUDA Graph（capture + replay）
+# corex-graph
 
-这套东西的用途只有一句话：**让 CoreX（BI-V100）上的程序能真的用 CUDA Graph**。
+这套东西的用途只有一句话：**让 BI-V100 上的程序能真的用 CUDA Graph**。
 厂商驱动单张图最多 128 个节点，超了不是被拦就是崩，所以大模型/大 step 的捕获根本走不通。
 这里在 capture 期把大图自动切成每段 ≤118 节点的多段图，`Instantiate` / `Launch` / `Destroy`
 仍然是你程序里那几个原生调用，内部按段 replay
