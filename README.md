@@ -1,56 +1,86 @@
-# graph —— 给自己程序接上 CUDA Graph 自动切段
+# graph —— 在自己程序里用上 CUDA Graph（capture + replay）
 
-这个仓库是给 Iluvatar CoreX（BI-V100，CoreX 3.2.1）用的一个 `LD_PRELOAD` 补丁：
-厂商驱动单张图最多 128 个节点，超了要么拦、要么崩。它在你程序无感知的情况下把一张大图
-在 capture 期自动切成多段（每段 ≤118 节点），`Instantiate`/`Launch`/`Destroy` 照原样调，
-内部按段串行 replay。
+这套东西的用途只有一句话：**让 CoreX（BI-V100）上的程序能真的用 CUDA Graph**。
+厂商驱动单张图最多 128 个节点，超了不是被拦就是崩，所以大模型/大 step 的捕获根本走不通。
+这里在 capture 期把大图自动切成每段 ≤118 节点的多段图，`Instantiate` / `Launch` / `Destroy`
+仍然是你程序里那几个原生调用，内部按段 replay —— 你的代码不需要知道"切了"这件事。
 
-接入不改一行代码，只加环境变量。
+接入只有一个 `.so` + 三个环境变量，不改你程序一行代码。
 
 ---
 
-## 1. 编译（计算节点上，`cuda.h` 在 `/usr/local/corex/include`）
+## 1. 你的程序侧要做的（就四步）
 
-```bash
-gcc -shared -fPIC -O2 -I/usr/local/corex/include -o cap_split.so cap_split.c -ldl -lpthread
+以 runtime API 为例，标准 CUDA Graph 用法即可：
+
+```c
+cudaStream_t st;  cudaStreamCreate(&st);
+
+/* 1) 开始捕获 */
+cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+
+/* 2) 捕获期：kernel / memcpy / memset / event 照常提交，别同步、别切流 */
+for (int i = 0; i < N; i++) my_kernel<<<grid, block, 0, st>>>(...);
+
+/* 3) 结束捕获，拿到图 */
+cudaGraph_t g = NULL;
+cudaStreamEndCapture(st, &g);
+
+/* 4) instantiate 一次，然后每轮只 replay */
+cudaGraphExec_t ge = NULL;
+cudaGraphInstantiate(&ge, g, NULL, NULL, 0);
+for (int it = 0; it < M; it++) {
+    cudaGraphLaunch(ge, st);       /* 就是它变快了：N 次提交压成 1 次 */
+    cudaStreamSynchronize(st);
+}
+cudaGraphExecDestroy(ge); cudaGraphDestroy(g);
 ```
 
-产物是一个 `.so`，和你的程序放一起就行。
+驱动 API 完全对称，参数一一对应：
+
+| runtime | driver |
+|---|---|
+| `cudaStreamBeginCapture(st, mode)` | `cuStreamBeginCapture_v2(st, mode)` |
+| `cudaStreamEndCapture(st, &g)` | `cuStreamEndCapture(st, &g)` |
+| `cudaGraphInstantiate(&ge, g, ...)` | `cuGraphInstantiate_v2(&ge, g, ...)` |
+| `cudaGraphLaunch(ge, st)` | `cuGraphLaunch(ge, st)` |
+| `cudaGraphExecDestroy(ge)` / `cudaGraphDestroy(g)` | `cuGraphExecDestroy` / `cuGraphDestroy` |
+
+两条入口这层都截了（runtime 侧 11 个 `cuda*` 代理、driver 侧 8 个可记录 API + 5 个图 API），
+所以你用哪套都行，混用也行。
 
 ## 2. 接上
 
 ```bash
+# 编（计算节点，cuda.h 在 /usr/local/corex/include）
+gcc -shared -fPIC -O2 -I/usr/local/corex/include -o cap_split.so cap_split.c -ldl -lpthread
+
+# 跑
 LD_PRELOAD=/abs/path/cap_split.so \
 SPLIT_LOG=/tmp/cap_split.log \
 SPLIT_LIMIT=118 \
 python your_train.py        # 或 ./your_binary
 ```
 
-就这三行。你的程序里 `cudaStreamBeginCapture / cudaStreamEndCapture / cudaGraphInstantiate /
-cudaGraphLaunch`（或对应的 `cu*` 驱动接口）都不用改。
+`N ≤ 118` 时这层等于透明，行为与不加完全一致（实测 K=100 的 capture+replay 耗时与原生一致）；
+`N > 118` 时它替你把图切开，绕过 128 上限。
 
-## 3. 确认真的接上了（必看）
-
-跑完 `grep` 一下日志，出现这几行就是生效了：
+## 3. 确认真的用上了（必看日志）
 
 ```
 SPLIT_BEGIN  stream=0x...  mode=1  limit=118
-SPLIT_SEAL   idx=0 nodes=118 counted=118     ← 切了第一段
-SPLIT_CHUNK_START idx=1                       ← 自动重开 capture
+SPLIT_SEAL   idx=0 nodes=118 counted=118   ← 切段发生在 capture 中途
+SPLIT_CHUNK_START idx=1                     ← 自动重开 capture
 SPLIT_SEAL   idx=1 nodes=118 counted=118
 SPLIT_END    chunks=3 nodes0=118 post_bad=0 graph=0x...
-SPLIT_INST_BIND chunks=3 exec=0x...           ← Instantiate 认到了这张图
+SPLIT_INST_BIND chunks=3 exec=0x...         ← Instantiate 认到了这张图
 SPLIT_SUMMARY record=300 seal=3 bind=1 launch=20
 ```
 
-判读方式：
-
-- `chunks` = 这次捕获被切成几段，`nodes` 每段必须 ≤`SPLIT_LIMIT`。
-- `record` = capture 期间被数到的可记录调用数；`record=0` 说明**根本没进这层**（见下面第 5 节的排查第一条）。
-- `bind=0` 但 `chunks>0`：Instantiate 没走到影子入口，`Launch` 时会退化成只跑第 0 段。
-- 最后跑一次健康检查程序，确认卡没被搞挂。
-
-单段（节点数 ≤118）的情况日志里 `chunks=1`，性能与不加这个 `.so` 完全一致。
+- `chunks=1` → 没切，说明你的图本来就 ≤118，这层只是透传。
+- `record` = capture 期数到的可记录调用数；**`record=0` 说明压根没进这层**，graph 也就没被接管。
+- `bind=0` 而 `chunks>0` → Instantiate 没走到影子入口，Launch 只会跑第 0 段（数据会缺，务必看这个）。
+- 校验数据别只看最终缓冲：捕获的节点会按段顺序重放，用"第 i 个节点向 `buf+i*4` 写 i、回放后逐槽比对"的方式验。
 
 ## 4. 环境变量
 
@@ -58,38 +88,35 @@ SPLIT_SUMMARY record=300 seal=3 bind=1 launch=20
 |---|---|---|
 | `SPLIT_LOG` | `/tmp/cap_split.log` | 日志路径 |
 | `SPLIT_LIMIT` | `118` | 每段节点上限（1..128）。**别设 128**，计数有 ±1 误差，留余量 |
-| `SPLIT_TRACE` | 关 | 逐段打 launch 点，崩的时候用它定位崩在第几段 |
-| `SPLIT_USE_NODES` | 关 | 用驱动的 `cuGraphGetNodes` 复核每段真实节点数（只调试用，见第 6 节第 1 条） |
-| `SPLIT_KEEP` | 关 | 各段 exec 常驻。**会崩**，只用于复现已知问题，不要在生产开 |
+| `SPLIT_TRACE` | 关 | 逐段打 launch 点，崩的时候定位崩在第几段 |
+| `SPLIT_USE_NODES` | 关 | 用 `cuGraphGetNodes` 复核真实节点数（调试用，见第 6 节第 1 条） |
+| `SPLIT_KEEP` | 关 | 各段 exec 常驻。**会崩**，只用于复现已知问题 |
 
-## 5. 没生效怎么查
+## 5. 用之前得知道的语义变化
 
-1. `record=0` → 你的程序走的是**没被影子到的那条入口**。这层同时截 `libcuda` 和
-   `libcudart` 两条（`cudaStreamBeginCapture` 等 11 个 runtime 入口已覆盖）。如果你用的是
-   `dlsym(handle, "cuGraphLaunch")` 直接取函数指针、自己封装一层，就会绕过。
-   先 `SPLIT_LOG` 看有没有 `SPLIT_RT_INSTALL` / `SPLIT_INSTALL` 这两行，没有就是没加载上。
-2. 有 `SPLIT_LOAD` 但没有 `SPLIT_BEGIN` → 你的捕获不是从被影子的 `Begin` 开始的
-   （比如用了 `cudaStreamBeginCaptureToGraph` 之类没覆盖的入口）。
-3. `SPLIT_UNSUPPORTED nested begin` → 你在同线程里嵌套捕获，这层不支持，会原样放行。
+1. **一次 `Launch` 从"异步提交"变成"提交到完成"**。段间要 `cuStreamSynchronize`，因为你不能同时
+   让两个 exec 活着跑（见第 6 节第 2 条）。所以 replay 返回时，前 n-1 段已经跑完了。
+2. **段边界的同步是固定开销**（本机约 1.5 ms/次）。实测 300 节点切成 3 段：
+   CPU 提交从 `0.752 µs/节点` 降到 `0.45 µs/节点`（−40%），但整轮 1848 µs → 3237 µs。
+   → **每段 GPU 工作量远大于一次同步时才净赚**；图很轻又必须切段，整轮会更慢。
+3. **每轮 `Launch` 都要现场 instantiate 中间段**（`instantiate → launch → 同步 → 销毁`），
+   这个开销也在每轮里，别把它算漏。
+4. capture 期只能提交**被记录的 API**（kernel launch、`memcpy*Async`、`memset*Async`、`eventRecord`、
+   `streamWaitEvent`）。用了没覆盖的入口，计数会偏少，段就可能超 128 而崩。
 
 ## 6. 复用时必须记住的几条（都是实测踩出来的）
 
 1. `cuGraphGetNodes` 会破坏调用方寄存器里存活的值，所以默认不调它，节点数靠自己计数。
-   要复核就开 `SPLIT_USE_NODES=1`，并且只做对照，别放进生产路径。
-2. 同 context 两个 exec 共存超过 64 节点，launch 第二段必崩。所以第 0 段用你自己的 exec，
-   其余段是 `instantiate → launch → 同步 → 销毁`，一次只有一个额外 exec 活着。
-3. **临时建的段 exec 必须先同步再销毁**。`launch → destroy` 直接连着写会挂死（`exit=124`，永不返回）。
-4. 因为第 2 条，一次 `Launch` 的语义变成了“提交到完成”（段间有 `cuStreamSynchronize`）。
-   每段 GPU 工作量远大于一次同步开销时才是净赚；图很轻又必须切段时整轮会更慢。
-5. `cuMemcpyDtoHAsync` 是 `(dstHost, srcDevice, size, stream)`，参数写反表现为“rc 全 0、数据全 0”。
+2. 同 context 两个 exec 共存超过 64 节点，launch 第二段必崩 → 只能串行，一次一个额外 exec。
+3. **临时建的段 exec 必须先同步再销毁**：`launch → destroy` 连着写会挂死（`exit=124`，永不返回）。
+4. 单流、顺序捕获才支持；嵌套捕获会打 `SPLIT_UNSUPPORTED` 原样放行（此时回到厂商 128 上限，大概率崩）。
+5. `cuMemcpyDtoHAsync` 是 `(dstHost, srcDevice, size, stream)`，参数写反表现为"rc 全 0、数据全 0"。
 
-## 7. 自检（可选）
-
-仓库带了几支裸驱动的小程序，用来在目标机上确认这套东西成立：
+## 7. 自检
 
 ```bash
-gcc -O2 -o test2s ../src/tests/test2s.c -ldl
-./test2s 0                   # 探活：打印 TEST2S_DONE 就是好卡
+gcc -O2 -o test2s tests/test2s.c -ldl
+./test2s 0                  # 打印 TEST2S_DONE 才是好卡
 ```
 
-历史作业与地址级依据在 `../../docs/`（`COREX-GRAPH-PATH.md`、`CAP-SPLIT.md`、`GRAPH-CHANNEL.md`）。
+地址级依据、行为学分类、历史作业溯源在 `../../docs/`（`COREX-GRAPH-PATH.md`、`CAP-SPLIT.md`、`GRAPH-CHANNEL.md`）。
