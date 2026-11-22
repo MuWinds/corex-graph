@@ -1,4 +1,22 @@
 # 构建产物
 *.so
 *.o
+*.pyc
+
+# 运行期产物：capture/回放日志、IR 落盘。复现时现生成，不入库。
 *.log
+
+# 24 MB 的 libtorch_cuda 全符号表，需要时从集群那台机器现导出（见 README §4）
+syms_torch.txt
+
+# 从集群取回来的快照文件副本，只为离线比对/打补丁；源头在 ~/cc_snap
+snap/
+tests/
+
+# tests/ 里的脚本、基准、补丁是复现入口，要入库；
+# 只忽略从集群现取回来的大块符号表快照（24 MB 的 syms_torch.txt 也在这条规则里）
+tests/syms_*.txt
+
+# 作业载荷与本地暂存
+*.tar.gz
+.tmp_stage/

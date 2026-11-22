@@ -1,0 +1,25 @@
+/* record_replay.map —— 让 record_replay 的钩子按 corex 的符号版本装上去
+ * （旧名 caprec.map；版本节点名 `CUDART` / `CAPREC` 不能改——它们要和 libcudart
+ *   里的版本名对上，也要和 cap_rec 时代已有的构建命令保持一致。）
+ *
+ * 不带这个脚本，preload 的无版本符号会被 glibc 的版本化查找忽略，钩子一次都不触发
+ * （实测表现：会话开了、节点 0、发射一次都看不见）。
+ */
+CUDART {
+  global:
+    cudaLaunchKernel;
+    cudaLaunchKernel_ptsz;
+    cudaMemcpyAsync;
+    cudaMemsetAsync;
+};
+
+CAPREC {
+  global:
+    caprec_begin;
+    caprec_end;
+    caprec_replay;
+    caprec_info;
+    caprec_graph_build;
+    caprec_graph_launch;
+    caprec_graph_free;
+};
